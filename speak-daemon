@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Read the Windows clipboard selection aloud, on request, with low latency.
+
+Stays resident. The cost that made the old PowerShell version feel sluggish was
+never synthesis - it was ~2000ms of process startup and assembly loading paid on
+every keypress. This process pays that once, at boot, so a request only costs
+the network round-trip to the voice service (~260ms measured) and playback
+begins on the first audio chunk rather than after the whole file is synthesised.
+
+Requests arrive as a file written by speak-clipboard.ahk, which owns the hotkey
+and reads the clipboard natively on the Windows side. A file is used rather than
+a socket because it is indifferent to how WSL happens to be doing networking
+today; a 30ms poll is irrelevant next to a 260ms round-trip.
+
+Any request toggles: speaking -> stop, idle -> speak. The daemon is the only
+thing tracking that state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import socket
+import sys
+from pathlib import Path
+
+# Re-exec under the daemon's own interpreter when started by anything else -
+# the shebang runs `python3`, which is /usr/bin/python3 and has no edge_tts.
+# A dedicated venv rather than a project environment, so it survives any
+# project environment being rebuilt. install.py creates it.
+VENV_PYTHON = Path.home() / ".local/share/speak-daemon/venv/bin/python"
+
+try:
+    import edge_tts  # pyright: ignore[reportMissingImports]
+except ModuleNotFoundError:
+    # Guarded by an env marker, not by comparing interpreter paths: a venv's
+    # bin/python is a symlink to the system one, so resolve() makes them equal
+    # and the re-exec never happens.
+    if os.environ.get("SPEAK_DAEMON_REEXEC"):
+        raise
+    os.environ["SPEAK_DAEMON_REEXEC"] = "1"
+    os.execv(  # nosec B606 - fixed interpreter path, no untrusted input
+        str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]]
+    )
+
+VOICE = "en-GB-RyanNeural"
+RATE = "+20%"
+
+REQUEST = Path("/mnt/c/Users/jimmy/AppData/Local/Temp/speak-request.txt")
+POLL_SECONDS = 0.03
+
+# A terminal selection is wrapped at the window width, so without this every
+# wrapped line would be read with a sentence-ending pause in the middle of it.
+UNWRAP = re.compile(r"(?<![.!?:;])\n(?=\S)")
+
+
+async def speak(text: str) -> None:
+    """Stream synthesis straight into the player, chunk by chunk.
+
+    Everything here is asyncio rather than blocking subprocess calls, and that
+    is load-bearing rather than stylistic. edge-tts delivers audio far faster
+    than it plays, so a blocking write into the player fills the pipe buffer and
+    then parks until the player drains it - at playback speed. On a
+    single-threaded loop that stalls the request poller too, so a stop pressed
+    during a long passage was not even seen for one to three seconds.
+
+    The low-delay flags are worth ~460ms: by default ffplay probes the stream
+    and fills a buffer before opening the audio device, which on a piped feed
+    means waiting for far more audio than it needs to start.
+    """
+    player = await asyncio.create_subprocess_exec(
+        "ffplay",
+        "-nodisp",
+        "-autoexit",
+        "-loglevel",
+        "quiet",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-i",
+        "pipe:0",
+        stdin=asyncio.subprocess.PIPE,
+    )
+    stdin = player.stdin
+    assert stdin is not None  # nosec B101 - guaranteed by stdin=PIPE above
+    try:
+        async for chunk in edge_tts.Communicate(text, VOICE, rate=RATE).stream():
+            if chunk["type"] == "audio":
+                stdin.write(chunk["data"])
+                await stdin.drain()
+        stdin.close()
+        await player.wait()
+    except asyncio.CancelledError:
+        player.kill()
+        await player.wait()
+        raise
+    finally:
+        if player.returncode is None:
+            player.kill()
+            await player.wait()
+
+
+async def main() -> None:
+    current: asyncio.Task[None] | None = None
+    last_seen = REQUEST.stat().st_mtime_ns if REQUEST.exists() else 0
+
+    while True:
+        await asyncio.sleep(POLL_SECONDS)
+        if not REQUEST.exists():
+            continue
+        mtime = REQUEST.stat().st_mtime_ns
+        if mtime == last_seen:
+            continue
+        last_seen = mtime
+
+        if current and not current.done():
+            current.cancel()
+            current = None
+            continue
+
+        text = REQUEST.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            continue
+        current = asyncio.create_task(speak(UNWRAP.sub(" ", text)))
+
+
+def claim_single_instance() -> socket.socket:
+    """Abstract-socket lock: released by the kernel however the process dies.
+
+    A pidfile would outlive a kill -9 and lock out every later start.
+    """
+    lock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        lock.bind("\0jimmy-speak-daemon")
+    except OSError:
+        sys.exit("speak-daemon already running")
+    return lock
+
+
+if __name__ == "__main__":
+    _lock = claim_single_instance()
+    asyncio.run(main())
