@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speak text aloud on Jimmy's speakers. Text as arguments, or on stdin.
+"""Speak text aloud through speak-daemon. Text as arguments, or on stdin.
 
 Wraps the request file that speak-daemon watches. The daemon treats every
 request as a TOGGLE - speaking becomes silent, silent becomes speaking - which
@@ -15,7 +15,11 @@ import sys
 import time
 from pathlib import Path
 
-REQUEST = Path("/mnt/c/Users/jimmy/AppData/Local/Temp/speak-request.txt")
+# speak_paths.py sits next to this file; resolve() follows the ~/.local/bin symlink.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speak_paths import request_file  # noqa: E402
+
+REQUEST = request_file()
 
 
 def is_busy() -> bool:
@@ -32,6 +36,8 @@ def is_busy() -> bool:
     found = subprocess.run(
         ["pgrep", "-x", "ffplay"], capture_output=True, text=True
     ).stdout.split()
+    if not Path("/proc").exists():  # macOS: no zombie check possible
+        return bool(found)
     for pid in found:
         state = Path(f"/proc/{pid}/stat")
         if state.exists() and state.read_text().split(") ", 1)[1][0] != "Z":

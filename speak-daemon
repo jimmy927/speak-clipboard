@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the Windows clipboard selection aloud, on request, with low latency.
+"""Read text aloud, on request, with low latency.
 
 Stays resident. The cost that made the old PowerShell version feel sluggish was
 never synthesis - it was ~2000ms of process startup and assembly loading paid on
@@ -7,10 +7,11 @@ every keypress. This process pays that once, at boot, so a request only costs
 the network round-trip to the voice service (~260ms measured) and playback
 begins on the first audio chunk rather than after the whole file is synthesised.
 
-Requests arrive as a file written by speak-clipboard.ahk, which owns the hotkey
-and reads the clipboard natively on the Windows side. A file is used rather than
-a socket because it is indifferent to how WSL happens to be doing networking
-today; a 30ms poll is irrelevant next to a 260ms round-trip.
+Requests arrive as a file (see speak_paths.py). On WSL speak-clipboard.ahk
+writes it, owning the hotkey and reading the clipboard natively on the Windows
+side; elsewhere any hotkey tool can. A file is used rather than a socket because
+it is indifferent to how WSL happens to be doing networking today; a 30ms poll
+is irrelevant next to a 260ms round-trip.
 
 Any request toggles: speaking -> stop, idle -> speak. The daemon is the only
 thing tracking that state.
@@ -19,17 +20,21 @@ thing tracking that state.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import re
-import socket
 import sys
 from pathlib import Path
+from typing import IO
+
+# speak_paths.py sits next to this file; resolve() follows the ~/.local/bin symlink.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speak_paths import LOCK_FILE, STATE_DIR, VENV_PYTHON, request_file  # noqa: E402
 
 # Re-exec under the daemon's own interpreter when started by anything else -
 # the shebang runs `python3`, which is /usr/bin/python3 and has no edge_tts.
 # A dedicated venv rather than a project environment, so it survives any
-# project environment being rebuilt. install.py creates it.
-VENV_PYTHON = Path.home() / ".local/share/speak-daemon/venv/bin/python"
+# project environment being rebuilt. install.py creates it (VENV_PYTHON).
 
 try:
     import edge_tts  # pyright: ignore[reportMissingImports]
@@ -47,7 +52,7 @@ except ModuleNotFoundError:
 VOICE = "en-GB-RyanNeural"
 RATE = "+20%"
 
-REQUEST = Path("/mnt/c/Users/jimmy/AppData/Local/Temp/speak-request.txt")
+REQUEST = request_file()
 POLL_SECONDS = 0.03
 
 # A terminal selection is wrapped at the window width, so without this every
@@ -130,15 +135,17 @@ async def main() -> None:
         current = asyncio.create_task(speak(UNWRAP.sub(" ", text)))
 
 
-def claim_single_instance() -> socket.socket:
-    """Abstract-socket lock: released by the kernel however the process dies.
+def claim_single_instance() -> IO[str]:
+    """flock: released by the kernel however the process dies.
 
-    A pidfile would outlive a kill -9 and lock out every later start.
+    A pidfile would outlive a kill -9 and lock out every later start. flock
+    rather than an abstract socket, which only Linux has.
     """
-    lock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = LOCK_FILE.open("w")
     try:
-        lock.bind("\0jimmy-speak-daemon")
-    except OSError:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
         sys.exit("speak-daemon already running")
     return lock
 
