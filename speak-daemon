@@ -57,7 +57,10 @@ POLL_SECONDS = 0.03
 
 # A terminal selection is wrapped at the window width, so without this every
 # wrapped line would be read with a sentence-ending pause in the middle of it.
-UNWRAP = re.compile(r"(?<![.!?:;])\n(?=\S)")
+# The next line often starts with the terminal app's indent, so the spaces on
+# both sides of the break go too. Run after \r\n -> \n: the Windows clipboard
+# uses CRLF.
+UNWRAP = re.compile(r"(?<![.!?:;])[ \t]*\n[ \t]*(?=\S)")
 
 
 async def speak(text: str) -> None:
@@ -144,7 +147,7 @@ async def main() -> None:
             current = None
             continue
 
-        text = REQUEST.read_text(encoding="utf-8", errors="replace").strip()
+        text = REQUEST.read_text(encoding="utf-8-sig", errors="replace").replace("\r\n", "\n").strip()
         if not text:
             continue
         current = asyncio.create_task(speak(UNWRAP.sub(" ", text)))
