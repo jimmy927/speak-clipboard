@@ -25,7 +25,7 @@ That's all. The installer detects your distro, user and Windows paths. It adds a
 
 From a WSL shell you can also run `speak "build finished"` or `make 2>&1 | tail -1 | speak`.
 
-**After a `git pull`**, run `install.py` again so the new code takes over.
+**After a `git pull`**, the daemon restarts into the new code by itself at the next idle moment. You only need to run `install.py` again if `speak-clipboard.ahk` changed.
 
 ## How it works
 

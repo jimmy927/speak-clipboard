@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install speak-clipboard. Safe to re-run; re-run it after every git pull.
+"""Install speak-clipboard. Safe to re-run; re-run it when speak-clipboard.ahk changes.
 
 Everywhere:
   1. A dedicated venv with edge-tts, where speak-daemon re-execs itself.

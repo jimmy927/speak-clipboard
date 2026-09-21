@@ -111,12 +111,27 @@ async def speak(text: str) -> None:
             await player.wait()
 
 
+# Its own source: when a git pull changes it, the daemon restarts into the new
+# code at the next idle moment, so nobody has to remember to restart it.
+CODE = (Path(__file__).resolve(), Path(__file__).resolve().parent / "speak_paths.py")
+
+
+def code_stamp() -> tuple[int, ...]:
+    return tuple(path.stat().st_mtime_ns for path in CODE)
+
+
 async def main() -> None:
     current: asyncio.Task[None] | None = None
     last_seen = REQUEST.stat().st_mtime_ns if REQUEST.exists() else 0
+    started = code_stamp()
 
     while True:
         await asyncio.sleep(POLL_SECONDS)
+        idle = current is None or current.done()
+        if idle and code_stamp() != started:
+            # The lock file is opened non-inheritable, so exec releases it and
+            # the new image claims it again.
+            os.execv(sys.executable, [sys.executable, __file__, *sys.argv[1:]])  # nosec B606
         if not REQUEST.exists():
             continue
         mtime = REQUEST.stat().st_mtime_ns
